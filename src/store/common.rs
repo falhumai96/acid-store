@@ -25,7 +25,7 @@ use uuid::Uuid;
 /// used as the storage backend for repositories in the `repo` module. Data stores do not need to
 /// provide their own locking mechanisms to protect against concurrent access.
 #[async_trait]
-pub trait DataStore {
+pub trait DataStore: Send {
     /// The error type for this data store.
     type Error: error::Error + Send + Sync + 'static;
 

@@ -16,7 +16,7 @@
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Once;
 
-use secrecy::{DebugSecret, ExposeSecret, Secret, SecretVec};
+use secrecy::{CloneableSecret, DebugSecret, ExposeSecret, Secret, SecretVec, Zeroize};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "encryption")]
@@ -182,9 +182,18 @@ impl KeySalt {
 /// An secret encryption key.
 ///
 /// The bytes of the key are zeroed in memory when this value is dropped.
+#[derive(Clone)]
 pub struct EncryptionKey(SecretVec<u8>);
 
+impl Zeroize for EncryptionKey {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl DebugSecret for EncryptionKey {}
+
+impl CloneableSecret for EncryptionKey {}
 
 impl Debug for EncryptionKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

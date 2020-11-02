@@ -16,6 +16,8 @@
 
 use std::collections::HashSet;
 
+use async_trait::async_trait;
+use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
 use crate::store::DataStore;
@@ -25,56 +27,70 @@ use super::object::{chunk_hash, Chunk};
 use super::state::{ChunkInfo, RepoState};
 
 /// Encode and decode chunks of data.
+#[async_trait]
 pub trait ChunkEncoder {
     /// Compress and encrypt the given `data` and return it.
-    fn encode_data(&self, data: &[u8]) -> crate::Result<Vec<u8>>;
+    async fn encode_data(&self, data: Vec<u8>) -> crate::Result<Vec<u8>>;
 
     /// Decrypt and decompress the given `data` and return it.
-    fn decode_data(&self, data: &[u8]) -> crate::Result<Vec<u8>>;
+    async fn decode_data(&self, data: Vec<u8>) -> crate::Result<Vec<u8>>;
 }
 
+#[async_trait]
 impl<S: DataStore> ChunkEncoder for RepoState<S> {
-    fn encode_data(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
-        let compressed_data = self.metadata.compression.compress(data)?;
-
-        Ok(self
-            .metadata
-            .encryption
-            .encrypt(compressed_data.as_slice(), &self.master_key))
+    async fn encode_data(&self, data: Vec<u8>) -> crate::Result<Vec<u8>> {
+        let compression = self.metadata.compression.clone();
+        let encryption = self.metadata.encryption.clone();
+        let master_key = self.master_key.clone();
+        spawn_blocking(move || {
+            compression
+                .compress(data.as_slice())
+                .map(|compressed_data| encryption.encrypt(compressed_data.as_slice(), &master_key))
+        })
+        .await
+        .unwrap()
     }
 
-    fn decode_data(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
-        let decrypted_data = self.metadata.encryption.decrypt(data, &self.master_key)?;
-
-        Ok(self
-            .metadata
-            .compression
-            .decompress(decrypted_data.as_slice())?)
+    async fn decode_data(&self, data: Vec<u8>) -> crate::Result<Vec<u8>> {
+        let compression = self.metadata.compression.clone();
+        let encryption = self.metadata.encryption.clone();
+        let master_key = self.master_key.clone();
+        spawn_blocking(move || {
+            encryption
+                .decrypt(data.as_slice(), &master_key)
+                .and_then(|decrypted_data| compression.decompress(decrypted_data.as_slice()))
+        })
+        .await
+        .unwrap()
     }
 }
 
 /// Read chunks of data.
+#[async_trait]
 pub trait ChunkReader {
     /// Return the bytes of the chunk with the given checksum.
-    fn read_chunk(&self, chunk: Chunk) -> crate::Result<Vec<u8>>;
+    async fn read_chunk(&self, chunk: Chunk) -> crate::Result<Vec<u8>>;
 }
 
+#[async_trait]
 impl<S: DataStore> ChunkReader for RepoState<S> {
-    fn read_chunk(&self, chunk: Chunk) -> crate::Result<Vec<u8>> {
+    async fn read_chunk(&self, chunk: Chunk) -> crate::Result<Vec<u8>> {
         let chunk_info = self.chunks.get(&chunk).ok_or(crate::Error::InvalidData)?;
         let chunk = self
             .store
             .lock()
             .unwrap()
             .read_block(chunk_info.block_id)
+            .await
             .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?
             .ok_or(crate::Error::InvalidData)?;
 
-        self.decode_data(chunk.as_slice())
+        self.decode_data(chunk).await
     }
 }
 
 /// Write chunks of data.
+#[async_trait]
 pub trait ChunkWriter {
     /// Write the given `data` as a new chunk and returns its checksum.
     ///
@@ -82,14 +98,15 @@ pub trait ChunkWriter {
     /// writing any new data.
     ///
     /// This requires a unique `id` which is used for reference counting.
-    fn write_chunk(&mut self, data: &[u8], id: UniqueId) -> crate::Result<Chunk>;
+    async fn write_chunk(&mut self, data: Vec<u8>, id: UniqueId) -> crate::Result<Chunk>;
 }
 
+#[async_trait]
 impl<S: DataStore> ChunkWriter for RepoState<S> {
-    fn write_chunk(&mut self, data: &[u8], id: UniqueId) -> crate::Result<Chunk> {
+    async fn write_chunk(&mut self, data: Vec<u8>, id: UniqueId) -> crate::Result<Chunk> {
         // Get a checksum of the unencoded data.
         let chunk = Chunk {
-            hash: chunk_hash(data),
+            hash: chunk_hash(data.as_slice()).await,
             size: data.len(),
         };
 
@@ -100,7 +117,7 @@ impl<S: DataStore> ChunkWriter for RepoState<S> {
         }
 
         // Encode the data.
-        let encoded_data = self.encode_data(data)?;
+        let encoded_data = self.encode_data(data).await?;
         let block_id = Uuid::new_v4();
 
         // Write the data to the data store.
@@ -108,6 +125,7 @@ impl<S: DataStore> ChunkWriter for RepoState<S> {
             .lock()
             .unwrap()
             .write_block(block_id, &encoded_data)
+            .await
             .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
 
         // Add the chunk to the header.
