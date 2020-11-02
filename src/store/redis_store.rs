@@ -18,7 +18,8 @@
 
 use std::fmt::{self, Debug, Formatter};
 
-use redis::{Commands, Connection, RedisError};
+use async_trait::async_trait;
+use redis::{aio::Connection, AsyncCommands, RedisError};
 use uuid::Uuid;
 
 use crate::store::common::DataStore;
@@ -48,9 +49,10 @@ impl RedisStore {
     /// library.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    pub fn new(mut connection: Connection) -> crate::Result<Self> {
+    pub async fn new(mut connection: Connection) -> crate::Result<Self> {
         let version_response: Option<String> = connection
             .get("version")
+            .await
             .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
 
         match version_response {
@@ -61,6 +63,7 @@ impl RedisStore {
             }
             None => connection
                 .set("version", CURRENT_VERSION)
+                .await
                 .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?,
         }
 
@@ -68,30 +71,34 @@ impl RedisStore {
     }
 }
 
+#[async_trait]
 impl DataStore for RedisStore {
     type Error = RedisError;
 
-    fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
+    async fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
         let key_id = id.to_hyphenated().to_string();
-        self.connection.set(format!("block:{}", key_id), data)?;
+        self.connection
+            .set(format!("block:{}", key_id), data)
+            .await?;
         Ok(())
     }
 
-    fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
+    async fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
         let key_id = id.to_hyphenated().to_string();
-        self.connection.get(format!("block:{}", key_id))
+        self.connection.get(format!("block:{}", key_id)).await
     }
 
-    fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
+    async fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
         let key_id = id.to_hyphenated().to_string();
-        self.connection.del(format!("block:{}", key_id))?;
+        self.connection.del(format!("block:{}", key_id)).await?;
         Ok(())
     }
 
-    fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
+    async fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
         let blocks = self
             .connection
-            .keys::<_, Vec<String>>("block:*")?
+            .keys::<_, Vec<String>>("block:*")
+            .await?
             .iter()
             .map(|key| {
                 let uuid = key.trim_start_matches("block:");

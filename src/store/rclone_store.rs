@@ -14,19 +14,21 @@
  * limitations under the License.
  */
 
-#![cfg(all(unix, feature = "store-rclone"))]
+#![cfg(all(feature = "store-rclone"))]
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
 use std::time::Duration;
 
+use async_ssh2::Session;
+use async_trait::async_trait;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use secrecy::{ExposeSecret, Secret, SecretString};
-use ssh2::Session;
+use smol::Async;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::store::{DataStore, SftpStore};
@@ -108,18 +110,18 @@ impl RcloneStore {
     /// library.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    pub fn new(config: String) -> crate::Result<Self> {
+    pub async fn new(config: String) -> crate::Result<Self> {
         // Serve the rclone remote over SFTP.
         let port = ephemeral_port()?;
         let password = generate_password(PASSWORD_LENGTH);
         let server_process = serve(port, &password, &config)?;
 
         // Attempt to connect to the SFTP server while we wait for it to start up.
-        let tcp_stream: TcpStream;
+        let tcp_stream: Async<TcpStream>;
         loop {
-            match TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)) {
+            match Async::<TcpStream>::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await {
                 Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                    sleep(CONNECT_WAIT_TIME);
+                    sleep(CONNECT_WAIT_TIME).await;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -136,12 +138,15 @@ impl RcloneStore {
         session.set_tcp_stream(tcp_stream);
         session
             .handshake()
+            .await
             .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
         session
             .userauth_password(SSH_USERNAME, password.expose_secret())
+            .await
             .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
         let sftp = session
             .sftp()
+            .await
             .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
 
         let sftp_store = SftpStore::new(sftp, PathBuf::from(""))?;
@@ -153,23 +158,24 @@ impl RcloneStore {
     }
 }
 
+#[async_trait]
 impl DataStore for RcloneStore {
-    type Error = io::Error;
+    type Error = async_ssh2::Error;
 
-    fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
-        self.sftp_store.write_block(id, data)
+    async fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
+        self.sftp_store.write_block(id, data).await
     }
 
-    fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.sftp_store.read_block(id)
+    async fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.sftp_store.read_block(id).await
     }
 
-    fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
-        self.sftp_store.remove_block(id)
+    async fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
+        self.sftp_store.remove_block(id).await
     }
 
-    fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
-        self.sftp_store.list_blocks()
+    async fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
+        self.sftp_store.list_blocks().await
     }
 }
 

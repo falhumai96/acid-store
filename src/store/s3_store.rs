@@ -16,9 +16,10 @@
 
 #![cfg(feature = "store-s3")]
 
+use async_trait::async_trait;
 use hex_literal::hex;
 use s3::bucket::Bucket;
-use s3::error::S3Error;
+use s3::S3Error;
 use uuid::Uuid;
 
 use super::common::DataStore;
@@ -78,11 +79,11 @@ impl S3Store {
     /// library.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    pub fn new(bucket: Bucket, prefix: &str) -> crate::Result<Self> {
+    pub async fn new(bucket: Bucket, prefix: &str) -> crate::Result<Self> {
         let prefix = prefix.trim_end_matches('/').to_owned();
         let version_key = join_key!(prefix, VERSION_KEY);
 
-        match bucket.get_object(&version_key) {
+        match bucket.get_object(&version_key).await {
             Ok((_, code)) if code == NOT_FOUND_CODE => {
                 bucket
                     .put_object(
@@ -90,6 +91,7 @@ impl S3Store {
                         CURRENT_VERSION.as_bytes(),
                         BINARY_CONTENT_TYPE,
                     )
+                    .await
                     .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
             }
             Ok((version_bytes, _)) => {
@@ -111,19 +113,21 @@ impl S3Store {
     }
 }
 
+#[async_trait]
 impl DataStore for S3Store {
     type Error = S3Error;
 
-    fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
+    async fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
         let block_path = self.block_path(id);
         self.bucket
-            .put_object(&block_path, data, BINARY_CONTENT_TYPE)?;
+            .put_object(&block_path, data, BINARY_CONTENT_TYPE)
+            .await?;
         Ok(())
     }
 
-    fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
+    async fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
         let block_path = self.block_path(id);
-        let (bytes, code) = self.bucket.get_object(&block_path)?;
+        let (bytes, code) = self.bucket.get_object(&block_path).await?;
         if code == NOT_FOUND_CODE {
             Ok(None)
         } else {
@@ -131,19 +135,20 @@ impl DataStore for S3Store {
         }
     }
 
-    fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
+    async fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
         let block_path = self.block_path(id);
-        self.bucket.delete_object(&block_path)?;
+        self.bucket.delete_object(&block_path).await?;
         Ok(())
     }
 
-    fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
+    async fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
         let blocks_path = join_key!(self.prefix, BLOCK_PREFIX) + SEPARATOR;
         let block_ids = self
             .bucket
-            .list_all(blocks_path.clone(), None)?
+            .list(blocks_path.clone(), None)
+            .await?
             .into_iter()
-            .flat_map(|(list, _)| list.contents)
+            .flat_map(|result| result.contents)
             .map(|object| {
                 Uuid::parse_str(object.key.trim_start_matches(&blocks_path))
                     .expect("Could not parse UUID.")

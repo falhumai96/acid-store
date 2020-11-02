@@ -20,7 +20,9 @@ use std::fmt::{self, Debug, Formatter};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use ssh2::{self, RenameFlags, Sftp};
+use async_ssh2::{self, RenameFlags, Sftp};
+use async_trait::async_trait;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use super::common::DataStore;
@@ -61,21 +63,23 @@ impl SftpStore {
             &path.join(STAGING_DIRECTORY),
         ];
         for directory in directories {
-            if sftp.stat(&directory).is_err() {
+            if sftp.stat(&directory).await.is_err() {
                 sftp.mkdir(&directory, 0o755)
+                    .await
                     .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
             }
         }
 
         let version_path = path.join(VERSION_FILE);
 
-        if sftp.stat(&version_path).is_ok() {
+        if sftp.stat(&version_path).await.is_ok() {
             // Read the version ID file.
             let mut version_file = sftp
                 .open(&version_path)
+                .await
                 .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
             let mut version_id = String::new();
-            version_file.read_to_string(&mut version_id)?;
+            version_file.read_to_string(&mut version_id).await?;
 
             // Verify the version ID.
             if version_id != CURRENT_VERSION {
@@ -85,8 +89,9 @@ impl SftpStore {
             // Write the version ID file.
             let mut version_file = sftp
                 .create(&version_path)
+                .await
                 .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
-            version_file.write_all(CURRENT_VERSION.as_bytes())?;
+            version_file.write_all(CURRENT_VERSION.as_bytes()).await?;
         }
 
         Ok(SftpStore { sftp, path })
@@ -107,73 +112,80 @@ impl SftpStore {
     }
 
     /// Return whether the given remote `path` exists.
-    fn exists(&self, path: &Path) -> bool {
-        self.sftp.stat(path).is_ok()
+    async fn exists(&self, path: &Path) -> bool {
+        self.sftp.stat(path).await.is_ok()
     }
 }
 
+#[async_trait]
 impl DataStore for SftpStore {
-    type Error = io::Error;
+    type Error = async_ssh2::Error;
 
-    fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
+    async fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
         let staging_path = self.staging_path(id);
         let block_path = self.block_path(id);
 
         // If this is the first block its sub-directory, the directory needs to be created.
         let parent = block_path.parent().unwrap();
-        if !self.exists(&parent) {
-            self.sftp.mkdir(&parent, 0o755)?;
+        if !self.exists(&parent).await {
+            self.sftp.mkdir(&parent, 0o755).await?;
         }
 
         // Write to a staging file and then atomically move it to its final destination.
-        let mut staging_file = self.sftp.create(&staging_path)?;
-        staging_file.write_all(data)?;
-        self.sftp.rename(
-            &staging_path,
-            &block_path,
-            Some(RenameFlags::ATOMIC | RenameFlags::OVERWRITE),
-        )?;
+        let mut staging_file = self.sftp.create(&staging_path).await?;
+        staging_file.write_all(data).await?;
+        self.sftp
+            .rename(
+                &staging_path,
+                &block_path,
+                Some(RenameFlags::ATOMIC | RenameFlags::OVERWRITE),
+            )
+            .await?;
 
         // Remove any unused staging files.
-        for (path, _) in self.sftp.readdir(&self.path.join(STAGING_DIRECTORY))? {
-            self.sftp.unlink(&path)?;
+        for (path, _) in self
+            .sftp
+            .readdir(&self.path.join(STAGING_DIRECTORY))
+            .await?
+        {
+            self.sftp.unlink(&path).await?;
         }
 
         Ok(())
     }
 
-    fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
+    async fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
         let block_path = self.block_path(id);
 
-        if !self.exists(&block_path) {
+        if !self.exists(&block_path).await {
             return Ok(None);
         }
 
-        let mut file = self.sftp.open(&block_path)?;
+        let mut file = self.sftp.open(&block_path).await?;
 
-        let mut buffer = Vec::with_capacity(file.stat()?.size.unwrap_or(0) as usize);
-        file.read_to_end(&mut buffer)?;
+        let mut buffer = Vec::with_capacity(file.stat().await?.size.unwrap_or(0) as usize);
+        file.read_to_end(&mut buffer).await?;
         Ok(Some(buffer))
     }
 
-    fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
+    async fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
         let block_path = self.block_path(id);
 
-        if !self.exists(&block_path) {
+        if !self.exists(&block_path).await {
             return Ok(());
         }
 
-        self.sftp.unlink(&block_path)?;
+        self.sftp.unlink(&block_path).await?;
 
         Ok(())
     }
 
-    fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
-        let block_directories = self.sftp.readdir(&self.path.join(BLOCKS_DIRECTORY))?;
+    async fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
+        let block_directories = self.sftp.readdir(&self.path.join(BLOCKS_DIRECTORY)).await?;
         let mut block_ids = Vec::new();
 
         for (block_directory, _) in block_directories {
-            for (block_path, _) in self.sftp.readdir(&block_directory)? {
+            for (block_path, _) in self.sftp.readdir(&block_directory).await? {
                 let file_name = block_path
                     .file_name()
                     .unwrap()

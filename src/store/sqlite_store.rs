@@ -16,8 +16,10 @@
 
 #![cfg(feature = "store-sqlite")]
 
+use async_trait::async_trait;
 use hex_literal::hex;
-use rusqlite::{params, Connection, OptionalExtension};
+use sqlx::prelude::*;
+use sqlx::{Cursor, Executor, Row, SqliteConnection};
 use uuid::Uuid;
 
 use crate::store::common::DataStore;
@@ -31,7 +33,7 @@ const CURRENT_VERSION: Uuid = Uuid::from_bytes(hex!("08d14eb8 4156 11ea 8ec7 a31
 #[derive(Debug)]
 pub struct SqliteStore {
     /// The connection to the SQLite database.
-    connection: Connection,
+    connection: SqliteConnection,
 }
 
 impl SqliteStore {
@@ -43,34 +45,35 @@ impl SqliteStore {
     /// library.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    pub fn new(connection: Connection) -> crate::Result<Self> {
-        connection
-            .execute_batch(
-                r#"
-                    CREATE TABLE IF NOT EXISTS Blocks (
-                        uuid BLOB PRIMARY KEY,
-                        data BLOB NOT NULL
-                    );
+    pub async fn new(mut connection: SqliteConnection) -> crate::Result<Self> {
+        let query = r#"
+            CREATE TABLE IF NOT EXISTS Blocks (
+                uuid BLOB PRIMARY KEY,
+                data BLOB NOT NULL
+            );
 
-                    CREATE TABLE IF NOT EXISTS Metadata (
-                        key TEXT PRIMARY KEY,
-                        value BLOB NOT NULL
-                    );
-                "#,
-            )
+            CREATE TABLE IF NOT EXISTS Metadata (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            );
+        "#;
+
+        connection
+            .execute(query)
+            .await
             .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
+
+        let query = r#"
+            SELECT value FROM Metadata
+            WHERE key = 'version';
+        "#;
 
         let version_bytes: Option<Vec<u8>> = connection
-            .query_row(
-                r#"
-                    SELECT value FROM Metadata
-                    WHERE key = 'version';
-                "#,
-                params![],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
+            .fetch(query)
+            .next()
+            .await
+            .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?
+            .map(|row| row.get("value"));
 
         match version_bytes {
             Some(bytes) => {
@@ -81,14 +84,17 @@ impl SqliteStore {
                 }
             }
             None => {
-                connection
-                    .execute(
-                        r#"
+                let sql = sqlx::query(
+                    r#"
                         INSERT INTO Metadata (key, value)
-                        VALUES ('version', ?1);
+                        VALUES ('version', ?);
                     "#,
-                        params![&CURRENT_VERSION.as_bytes()[..]],
-                    )
+                )
+                .bind(&CURRENT_VERSION.as_bytes()[..]);
+
+                connection
+                    .execute(sql)
+                    .await
                     .map_err(|error| crate::Error::Store(anyhow::Error::from(error)))?;
             }
         }
@@ -97,56 +103,68 @@ impl SqliteStore {
     }
 }
 
+#[async_trait]
 impl DataStore for SqliteStore {
-    type Error = rusqlite::Error;
+    type Error = sqlx::Error;
 
-    fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
-        self.connection.execute(
+    async fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
+        let sql = sqlx::query(
             r#"
                 REPLACE INTO Blocks (uuid, data)
-                VALUES (?1, ?2);
+                VALUES (?, ?);
             "#,
-            params![&id.as_bytes()[..], data],
-        )?;
+        )
+        .bind(&id.as_bytes()[..])
+        .bind(data);
+        self.connection.execute(sql).await?;
 
         Ok(())
     }
 
-    fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.connection
-            .query_row(
-                r#"
-                    SELECT data FROM Blocks
-                    WHERE uuid = ?1;
-                "#,
-                params![&id.as_bytes()[..]],
-                |row| row.get(0),
-            )
-            .optional()
+    async fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
+        let sql = sqlx::query(
+            r#"
+                SELECT data FROM Blocks
+                WHERE uuid = ?;
+            "#,
+        )
+        .bind(&id.as_bytes()[..]);
+
+        let data = self
+            .connection
+            .fetch(sql)
+            .next()
+            .await?
+            .map(|row| row.get("data"));
+
+        Ok(data)
     }
 
-    fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
-        self.connection.execute(
+    async fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
+        let sql = sqlx::query(
             r#"
                 DELETE FROM Blocks
-                WHERE uuid = ?1;
+                WHERE uuid = ?;
             "#,
-            params![&id.as_bytes()[..]],
-        )?;
+        )
+        .bind(&id.as_bytes()[..]);
+
+        self.connection.execute(sql).await?;
 
         Ok(())
     }
 
-    fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
-        let mut statement = self.connection.prepare(r#"SELECT uuid FROM Blocks;"#)?;
+    async fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
+        let query = r#"SELECT uuid FROM Blocks;"#;
+        let mut cursor = self.connection.fetch(query);
 
-        let result = statement
-            .query_map(params![], |row| {
-                row.get(0).map(|bytes: Vec<u8>| {
-                    Uuid::from_slice(bytes.as_slice()).expect("Could not parse UUID.")
-                })
-            })?
-            .collect::<Result<Vec<Uuid>, _>>()?;
+        let mut result = Vec::new();
+
+        while let Some(row) = cursor.next().await? {
+            let id_bytes: Vec<u8> = row.get("uuid");
+            let id = Uuid::from_slice(id_bytes.as_slice()).expect("Could not parse UUID.");
+            result.push(id);
+        }
 
         Ok(result)
     }

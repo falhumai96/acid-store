@@ -27,7 +27,7 @@ filetime = { version = "0.2.8", optional = true }
 cdchunking = "1.0.0"
 
 # SQL
-rusqlite = { version = "0.22.0", features = ["bundled"], optional = true }
+sqlx = { version = "0.3.5", features = ["runtime-tokio", "sqlite"], optional = true }
 
 # Redis
 redis = { version = "0.15.1", optional = true }
@@ -36,7 +36,7 @@ redis = { version = "0.15.1", optional = true }
 rust-s3 =  { version = "0.18.11", optional = true }
 
 # Sftp
-ssh2 = { version = "0.8.2", features = ["vendored-openssl"], optional = true }
+async-ssh2 = { version = "0.1.1-beta", optional = true }
 
 # Hashing
 digest = "0.8.1"
@@ -73,8 +73,9 @@ tempfile = { version = "3.1.0", optional = true }
 hex-literal = "0.2.1"
 
 # Async
-tokio = { version = "0.3.2", features = ["rt-multi-thread", "io-util", "macros", "sync", "fs"] }
-async_trait = "0.1.41"
+tokio = { version = "0.3.2", features = ["rt-multi-thread", "io-util", "sync", "fs"] }
+async-trait = "0.1.41"
+smol = { version = "0.1.4", optional = true }
 
 # Unix-specific dependencies
 [target.'cfg(unix)'.dependencies]
@@ -98,11 +99,11 @@ maplit = "1.0.2"
 default = ["store-directory"]
 
 store-directory = []
-store-sqlite = ["rusqlite"]
+store-sqlite = ["sqlx"]
 store-redis = ["redis"]
 store-s3 = ["rust-s3"]
-store-sftp = ["ssh2"]
-store-rclone = ["store-sftp", "rand"]
+store-sftp = ["async-ssh2"]
+store-rclone = ["store-sftp", "smol", "rand", "tokio/time"]
 file-metadata = ["nix", "filetime", "xattr", "posix-acl"]
 compression = ["flate2", "xz2", "lz4"]
 encryption = ["sodiumoxide", "rand"]

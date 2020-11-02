@@ -38,9 +38,9 @@ pub use {self::redis_store::RedisStore, redis};
 #[cfg(feature = "store-s3")]
 pub use {self::s3_store::S3Store, s3};
 #[cfg(feature = "store-sftp")]
-pub use {self::sftp_store::SftpStore, ssh2};
+pub use {self::sftp_store::SftpStore, async_ssh2};
 #[cfg(feature = "store-sqlite")]
-pub use {self::sqlite_store::SqliteStore, rusqlite};
+pub use {self::sqlite_store::SqliteStore, sqlx};
 
 mod common;
 mod directory_store;

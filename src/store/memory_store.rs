@@ -16,6 +16,8 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+
+use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::common::DataStore;
@@ -40,24 +42,25 @@ impl MemoryStore {
     }
 }
 
+#[async_trait]
 impl DataStore for MemoryStore {
     type Error = Infallible;
 
-    fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
+    async fn write_block(&mut self, id: Uuid, data: &[u8]) -> Result<(), Self::Error> {
         self.blocks.insert(id.to_owned(), data.to_owned());
         Ok(())
     }
 
-    fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
+    async fn read_block(&mut self, id: Uuid) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.blocks.get(&id).map(|data| data.to_owned()))
     }
 
-    fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
+    async fn remove_block(&mut self, id: Uuid) -> Result<(), Self::Error> {
         self.blocks.remove(&id);
         Ok(())
     }
 
-    fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
+    async fn list_blocks(&mut self) -> Result<Vec<Uuid>, Self::Error> {
         Ok(self.blocks.keys().copied().collect())
     }
 }
