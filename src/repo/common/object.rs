@@ -18,7 +18,7 @@ use std::clone::Clone;
 use std::cmp::min;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, SeekFrom};
 use std::mem::replace;
 
 use blake2::digest::{Input, VariableOutput};
@@ -32,7 +32,15 @@ use super::chunk_store::{ChunkReader, ChunkWriter};
 use super::id_table::UniqueId;
 use super::state::RepoState;
 use super::state::{ChunkLocation, ObjectState};
+use crate::repo::common::state::ObjectOperation;
 use crate::store::DataStore;
+use std::borrow::Borrow;
+use std::ops::{Deref, DerefMut};
+use std::task::Context;
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, Error, ReadBuf,
+};
+use tokio::macros::support::{Pin, Poll};
 use tokio::task::spawn_blocking;
 
 /// The size of the checksums used for uniquely identifying chunks.
@@ -118,7 +126,7 @@ impl ObjectHandle {
     /// Return whether this object has the same contents as `other`.
     ///
     /// See `ContentId::compare_contents` for details.
-    pub fn compare_contents(&self, other: impl Read) -> crate::Result<bool> {
+    pub async fn compare_contents(&self, other: impl AsyncRead) -> crate::Result<bool> {
         self.content_id().compare_contents(other)
     }
 }
@@ -175,7 +183,7 @@ impl ContentId {
     ///
     /// # Errors
     /// - `Error::Io`: An I/O error occurred.
-    pub fn compare_contents(&self, mut other: impl Read) -> crate::Result<bool> {
+    pub async fn compare_contents(&self, mut other: impl AsyncRead) -> crate::Result<bool> {
         let mut buffer = Vec::new();
 
         for chunk in &self.chunks {
@@ -184,7 +192,7 @@ impl ContentId {
                 buffer.resize(chunk.size, 0u8);
             }
 
-            if let Err(error) = other.read_exact(&mut buffer[..chunk.size]) {
+            if let Err(error) = other.read_exact(&mut buffer[..chunk.size]).await {
                 return if error.kind() == io::ErrorKind::UnexpectedEof {
                     Ok(false)
                 } else {
@@ -192,13 +200,13 @@ impl ContentId {
                 };
             }
 
-            if chunk.hash != chunk_hash(&buffer[..chunk.size]) {
+            if chunk.hash != chunk_hash(&buffer[..chunk.size]).await {
                 return Ok(false);
             }
         }
 
         // Handle the case where `other` is longer than this object.
-        if other.read(&mut buffer)? != 0 {
+        if other.read(&mut buffer).await? != 0 {
             return Ok(false);
         }
 
@@ -209,19 +217,19 @@ impl ContentId {
 /// A wrapper for getting information about an object.
 struct ObjectInfo<'a, S: DataStore> {
     repo_state: &'a RepoState<S>,
-    object_state: &'a ObjectState,
+    object_state: &'a ObjectState<'a>,
     handle: &'a ObjectHandle,
 }
 
 impl<'a, S: DataStore> ObjectInfo<'a, S> {
     /// Verify the integrity of the data in this object.
-    fn verify(&self) -> crate::Result<bool> {
+    async fn verify(&self) -> crate::Result<bool> {
         let expected_chunks = self.handle.chunks.iter().copied().collect::<Vec<_>>();
 
         for chunk in expected_chunks {
-            match self.repo_state.read_chunk(chunk) {
+            match self.repo_state.read_chunk(chunk).await {
                 Ok(data) => {
-                    if data.len() != chunk.size || chunk_hash(&data) != chunk.hash {
+                    if data.len() != chunk.size || chunk_hash(&data).await != chunk.hash {
                         return Ok(false);
                     }
                 }
@@ -260,7 +268,7 @@ impl<'a, S: DataStore> ObjectInfo<'a, S> {
 
 struct ObjectReader<'a, S: DataStore> {
     repo_state: &'a RepoState<S>,
-    object_state: &'a mut ObjectState,
+    object_state: &'a mut ObjectState<'a>,
     handle: &'a ObjectHandle,
 }
 
@@ -277,7 +285,7 @@ impl<'a, S: DataStore> ObjectReader<'a, S> {
     /// Return the slice of bytes between the current seek position and the end of the chunk.
     ///
     /// The returned slice will be no longer than `size`.
-    fn read_chunk(&mut self, size: usize) -> crate::Result<&[u8]> {
+    async fn read_chunk(&mut self, size: usize) -> crate::Result<&[u8]> {
         // If the object is empty, there's no data to read.
         let current_location = match self.object_info().current_chunk() {
             Some(location) => location,
@@ -287,7 +295,8 @@ impl<'a, S: DataStore> ObjectReader<'a, S> {
         // If we're reading from a new chunk, read the contents of that chunk into the read buffer.
         if Some(current_location.chunk) != self.object_state.buffered_chunk {
             self.object_state.buffered_chunk = Some(current_location.chunk);
-            self.object_state.read_buffer = self.repo_state.read_chunk(current_location.chunk)?;
+            self.object_state.read_buffer =
+                self.repo_state.read_chunk(current_location.chunk).await?;
         }
 
         let start = current_location.relative_position();
@@ -296,17 +305,28 @@ impl<'a, S: DataStore> ObjectReader<'a, S> {
     }
 
     /// Attempt to deserialize the bytes in the object as a value of type `T`.
-    fn deserialize<T: DeserializeOwned>(&mut self) -> crate::Result<T> {
-        self.seek(SeekFrom::Start(0))?;
-        from_read(self).map_err(|_| crate::Error::Deserialize)
+    async fn deserialize<T: DeserializeOwned>(&mut self) -> crate::Result<T> {
+        self.seek(SeekFrom::Start(0)).await?;
+        let mut buffer = Vec::with_capacity(self.handle.size as usize);
+        self.read_to_end(&mut buffer).await?;
+        from_read(&buffer).map_err(|_| crate::Error::Deserialize)
+    }
+
+    /// The implementation for `AsyncRead::poll_read`.
+    async fn read_impl(&mut self, buf: &mut ReadBuf) -> io::Result<()> {
+        let next_chunk = self.deref().read_chunk(buf.capacity()).await?;
+        let bytes_read = next_chunk.len();
+        buf.put_slice(next_chunk);
+        self.object_state.position += bytes_read as u64;
+        Ok(())
     }
 }
 
-impl<'a, S: DataStore> Seek for ObjectReader<'a, S> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+impl<'a, S: DataStore> AsyncSeek for ObjectReader<'a, S> {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
         let object_size = self.handle.size;
 
-        let new_position = match pos {
+        self.object_state.next_position = Some(match position {
             SeekFrom::Start(offset) => min(object_size, offset),
             SeekFrom::End(offset) => {
                 if offset > object_size as i64 {
@@ -331,29 +351,55 @@ impl<'a, S: DataStore> Seek for ObjectReader<'a, S> {
                     )
                 }
             }
-        };
+        });
 
-        self.object_state.position = new_position;
-        Ok(new_position)
+        Ok(())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        if let ObjectOperation::None = &self.object_state.current_operation {
+            if let Some(position) = self.object_state.next_position {
+                self.object_state.position = position;
+            }
+            self.object_state.next_position = None;
+            Poll::Ready(Ok(self.object_state.position))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
 // To avoid reading the same chunk from the repository multiple times, the chunk which was most
 // recently read from is cached in a buffer.
-impl<'a, S: DataStore> Read for ObjectReader<'a, S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let next_chunk = self.read_chunk(buf.len())?;
-        let bytes_read = next_chunk.len();
-        buf[..bytes_read].copy_from_slice(next_chunk);
-        self.object_state.position += bytes_read as u64;
-        Ok(bytes_read)
+impl<'a, S: DataStore> AsyncRead for ObjectReader<'a, S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let result = match &self.object_state.current_operation {
+            ObjectOperation::Read(future) => future.poll(cx),
+            ObjectOperation::None => {
+                let future = Box::pin(self.borrow().read_impl(buf));
+                let result = future.poll(cx);
+                self.borrow().object_state.current_operation = ObjectOperation::Read(future);
+                result
+            }
+            _ => Poll::Pending,
+        };
+
+        if result.is_ready() {
+            self.borrow().object_state.current_operation = ObjectOperation::None;
+        }
+
+        result
     }
 }
 
 /// A wrapper for writing data to an object.
 struct ObjectWriter<'a, S: DataStore> {
     repo_state: &'a mut RepoState<S>,
-    object_state: &'a mut ObjectState,
+    object_state: &'a mut ObjectState<'a>,
     handle: &'a mut ObjectHandle,
 }
 
@@ -374,8 +420,8 @@ impl<'a, S: DataStore> ObjectWriter<'a, S> {
         }
     }
 
-    fn truncate(&mut self, length: u64) -> crate::Result<()> {
-        self.flush()?;
+    async fn truncate(&mut self, length: u64) -> crate::Result<()> {
+        self.flush().await?;
         if length >= self.handle.size {
             return Ok(());
         }
@@ -389,11 +435,12 @@ impl<'a, S: DataStore> ObjectWriter<'a, S> {
             Some(location) => location,
             None => return Ok(()),
         };
-        let last_chunk = self.repo_state.read_chunk(end_location.chunk)?;
+        let last_chunk = self.repo_state.read_chunk(end_location.chunk).await?;
         let new_last_chunk = &last_chunk[..end_location.relative_position()];
         let new_last_chunk = self
             .repo_state
-            .write_chunk(&new_last_chunk, self.handle.handle_id)?;
+            .write_chunk(new_last_chunk.to_vec(), self.handle.handle_id)
+            .await?;
 
         // Remove all chunks including and after the final chunk.
         self.handle.chunks.drain(end_location.index..);
@@ -412,33 +459,29 @@ impl<'a, S: DataStore> ObjectWriter<'a, S> {
     }
 
     /// Serialize the given `value` and write it to the object.
-    fn serialize<T: Serialize>(&mut self, value: &T) -> crate::Result<()> {
+    async fn serialize<T: Serialize>(&mut self, value: &T) -> crate::Result<()> {
         let serialized = to_vec(value).map_err(|_| crate::Error::Serialize)?;
-        self.object_reader().seek(SeekFrom::Start(0))?;
-        self.write_all(serialized.as_slice())?;
-        self.flush()?;
-        self.truncate(serialized.len() as u64)?;
+        self.object_reader().seek(SeekFrom::Start(0)).await?;
+        self.write_all(serialized.as_slice()).await?;
+        self.flush().await?;
+        self.truncate(serialized.len() as u64).await?;
         Ok(())
     }
 
     /// Write chunks stored in the chunker to the repository.
-    fn write_chunks(&mut self) -> crate::Result<()> {
+    async fn write_chunks(&mut self) -> crate::Result<()> {
         for chunk_data in self.object_state.chunker.chunks() {
             let chunk = self
                 .repo_state
-                .write_chunk(&chunk_data, self.handle.handle_id)?;
+                .write_chunk(chunk_data, self.handle.handle_id)
+                .await?;
             self.object_state.new_chunks.push(chunk);
         }
         Ok(())
     }
-}
 
-// Content-defined chunking makes writing and seeking more complicated. Chunks can't be modified
-// in-place; they can only be read or written in their entirety. This means we need to do a lot of
-// buffering to wait for a chunk boundary before writing a chunk to the repository. It also means
-// the user needs to explicitly call `flush` when they're done writing data.
-impl<'a, S: DataStore> Write for ObjectWriter<'a, S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    /// The implementation for `AsyncWrite::poll_write`.
+    async fn write_impl(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Check if this is the first time `write` is being called after calling `flush`.
         if !self.object_state.needs_flushed {
             // Because we're starting a new write, we need to set the starting location.
@@ -450,16 +493,17 @@ impl<'a, S: DataStore> Write for ObjectWriter<'a, S> {
 
                 // We need to make sure the data before the seek position is saved when we replace
                 // the chunk. Read this data from the repository and write it to the chunker.
-                let first_chunk = self.repo_state.read_chunk(chunk)?;
+                let first_chunk = self.repo_state.read_chunk(chunk).await?;
                 self.object_state
                     .chunker
-                    .write_all(&first_chunk[..position])?;
+                    .write_all(&first_chunk[..position])
+                    .await?;
             }
         }
 
         // Chunk the data and write any complete chunks to the repository.
-        self.object_state.chunker.write_all(buf)?;
-        self.write_chunks()?;
+        self.object_state.chunker.write_all(buf).await?;
+        self.borrow().write_chunks().await?;
 
         // Advance the seek position.
         self.object_state.position += buf.len() as u64;
@@ -470,7 +514,8 @@ impl<'a, S: DataStore> Write for ObjectWriter<'a, S> {
         Ok(buf.len())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    /// The implementation for `AsyncWrite::poll_flush`.
+    async fn flush_impl(&mut self) -> io::Result<()> {
         if !self.object_state.needs_flushed {
             // No new data has been written since data was last flushed.
             return Ok(());
@@ -481,15 +526,16 @@ impl<'a, S: DataStore> Write for ObjectWriter<'a, S> {
         if let Some(location) = &current_chunk {
             // We need to make sure the data after the seek position is saved when we replace the
             // current chunk. Read this data from the repository and write it to the chunker.
-            let last_chunk = self.repo_state.read_chunk(location.chunk)?;
+            let last_chunk = self.repo_state.read_chunk(location.chunk).await?;
             self.object_state
                 .chunker
-                .write_all(&last_chunk[location.relative_position()..])?;
+                .write_all(&last_chunk[location.relative_position()..])
+                .await?;
         }
 
         // Write all the remaining data in the chunker to the repository.
-        self.object_state.chunker.flush()?;
-        self.write_chunks()?;
+        self.object_state.chunker.flush().await?;
+        self.borrow().write_chunks().await?;
 
         // Find the index of the first chunk which is being overwritten.
         let start_index = self
@@ -531,6 +577,61 @@ impl<'a, S: DataStore> Write for ObjectWriter<'a, S> {
     }
 }
 
+// TODO: What happens if the result from the `ObjectOperation::Write` doesn't match the `buf` that
+//   was passed in?
+
+// Content-defined chunking makes writing and seeking more complicated. Chunks can't be modified
+// in-place; they can only be read or written in their entirety. This means we need to do a lot of
+// buffering to wait for a chunk boundary before writing a chunk to the repository. It also means
+// the user needs to explicitly call `flush` when they're done writing data.
+impl<'a, S: DataStore> AsyncWrite for ObjectWriter<'a, S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = match &self.object_state.current_operation {
+            ObjectOperation::Write(future) => future.poll(cx),
+            ObjectOperation::None => {
+                let future = Box::pin(self.borrow().write_impl(buf));
+                let result = future.poll(cx);
+                self.borrow().object_state.current_operation = ObjectOperation::Write(future);
+                result
+            }
+            _ => Poll::Pending,
+        };
+
+        if result.is_ready() {
+            self.borrow().object_state.current_operation = ObjectOperation::None;
+        }
+
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let result = match &self.object_state.current_operation {
+            ObjectOperation::Flush(future) => future.poll(cx),
+            ObjectOperation::None => {
+                let future = Box::pin(self.borrow().flush_impl());
+                let result = future.poll(cx);
+                self.borrow().object_state.current_operation = ObjectOperation::Flush(future);
+                result
+            }
+            _ => Poll::Pending,
+        };
+
+        if result.is_ready() {
+            self.borrow().object_state.current_operation = ObjectOperation::None;
+        }
+
+        result
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.poll_flush(cx)
+    }
+}
+
 /// An read-only view of data in a repository.
 ///
 /// A `ReadOnlyObject` is a view of data in a repository. It implements `Read` and `Seek` for
@@ -543,7 +644,7 @@ pub struct ReadOnlyObject<'a, S: DataStore> {
     repo_state: &'a RepoState<S>,
 
     /// The state for the object itself.
-    object_state: ObjectState,
+    object_state: ObjectState<'a>,
 
     /// The object handle which stores the hashes of the chunks which make up the object.
     handle: &'a ObjectHandle,
@@ -598,34 +699,42 @@ impl<'a, S: DataStore> ReadOnlyObject<'a, S> {
     /// flush written data with `flush` before calling this method.
     ///
     /// See `ContentId::compare_contents` for details.
-    pub fn compare_contents(&self, other: impl Read) -> crate::Result<bool> {
-        self.handle.compare_contents(other)
+    pub async fn compare_contents(&self, other: impl AsyncRead) -> crate::Result<bool> {
+        self.handle.compare_contents(other).await
     }
 
     /// Verify the integrity of the data in this object.
     ///
     /// See `Object::verify` for details.
-    pub fn verify(&self) -> crate::Result<bool> {
-        self.object_info().verify()
+    pub async fn verify(&self) -> crate::Result<bool> {
+        self.object_info().verify().await
     }
 
     /// Deserialize a value serialized with `Object::serialize`.
     ///
     /// See `Object::deserialize` for details.
-    pub fn deserialize<T: DeserializeOwned>(&mut self) -> crate::Result<T> {
-        self.object_reader().deserialize()
+    pub async fn deserialize<T: DeserializeOwned>(&mut self) -> crate::Result<T> {
+        self.object_reader().deserialize().await
     }
 }
 
-impl<'a, S: DataStore> Read for ReadOnlyObject<'a, S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.object_reader().read(buf)
+impl<'a, S: DataStore> AsyncRead for ReadOnlyObject<'a, S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.borrow().object_reader().poll_read(cx, buf)
     }
 }
 
-impl<'a, S: DataStore> Seek for ReadOnlyObject<'a, S> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.object_reader().seek(pos)
+impl<'a, S: DataStore> AsyncSeek for ReadOnlyObject<'a, S> {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        self.borrow().object_reader().start_seek(position)
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        self.borrow().object_reader().poll_complete(cx)
     }
 }
 
@@ -654,7 +763,7 @@ pub struct Object<'a, S: DataStore> {
     repo_state: &'a mut RepoState<S>,
 
     /// The state for the object itself.
-    object_state: ObjectState,
+    object_state: ObjectState<'a>,
 
     /// The object handle which stores the hashes of the chunks which make up the object.
     handle: &'a mut ObjectHandle,
@@ -718,8 +827,8 @@ impl<'a, S: DataStore> Object<'a, S> {
     /// flush written data with `flush` before calling this method.
     ///
     /// See `ContentId::compare_contents` for details.
-    pub fn compare_contents(&self, other: impl Read) -> crate::Result<bool> {
-        self.handle.compare_contents(other)
+    pub async fn compare_contents(&self, other: impl AsyncRead) -> crate::Result<bool> {
+        self.handle.compare_contents(other).await
     }
 
     /// Verify the integrity of the data in this object.
@@ -733,8 +842,8 @@ impl<'a, S: DataStore> Object<'a, S> {
     /// - `Error::InvalidData`: Ciphertext verification failed.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    pub fn verify(&self) -> crate::Result<bool> {
-        self.object_info().verify()
+    pub async fn verify(&self) -> crate::Result<bool> {
+        self.object_info().verify().await
     }
 
     /// Truncate the object to the given `length`.
@@ -747,8 +856,8 @@ impl<'a, S: DataStore> Object<'a, S> {
     /// - `Error::InvalidData`: Ciphertext verification failed.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    pub fn truncate(&mut self, length: u64) -> crate::Result<()> {
-        self.object_writer().truncate(length)
+    pub async fn truncate(&mut self, length: u64) -> crate::Result<()> {
+        self.object_writer().truncate(length).await
     }
 
     /// Serialize the given `value` and write it to the object.
@@ -762,8 +871,8 @@ impl<'a, S: DataStore> Object<'a, S> {
     /// - `Error::InvalidData`: Ciphertext verification failed.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    pub fn serialize<T: Serialize>(&mut self, value: &T) -> crate::Result<()> {
-        self.object_writer().serialize(value)
+    pub async fn serialize<T: Serialize>(&mut self, value: &T) -> crate::Result<()> {
+        self.object_writer().serialize(value).await
     }
 
     /// Deserialize a value serialized with `Object::serialize`.
@@ -776,50 +885,70 @@ impl<'a, S: DataStore> Object<'a, S> {
     /// - `Error::InvalidData`: Ciphertext verification failed.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    pub fn deserialize<T: DeserializeOwned>(&mut self) -> crate::Result<T> {
-        self.object_reader().deserialize()
+    pub async fn deserialize<T: DeserializeOwned>(&mut self) -> crate::Result<T> {
+        self.object_reader().deserialize().await
     }
 }
 
-impl<'a, S: DataStore> Read for Object<'a, S> {
+impl<'a, S: DataStore> AsyncRead for Object<'a, S> {
     /// The `io::Error` returned by this method can be converted into an `acid_store::Error`.
     ///
     /// # Errors
     /// - `Error::InvalidData`: Ciphertext verification failed.
     /// - `Error::Store`: An error occurred with the data store.
     /// - `Error::Io`: An I/O error occurred.
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.object_writer().flush()?;
-        self.object_reader().read(buf)
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let ObjectOperation::None = &self.object_state.current_operation {
+            if self.object_state.needs_flushed {
+                self.poll_flush(cx);
+                Poll::Pending
+            } else {
+                self.poll_read(cx, buf)
+            }
+        } else {
+            Poll::Pending
+        }
     }
 }
 
-impl<'a, S: DataStore> Seek for Object<'a, S> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.object_writer().flush()?;
-        self.object_reader().seek(pos)
+impl<'a, S: DataStore> AsyncSeek for Object<'a, S> {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        self.borrow().object_reader().start_seek(position)
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        if let ObjectOperation::None = &self.object_state.current_operation {
+            if self.object_state.needs_flushed {
+                self.poll_flush(cx);
+                Poll::Pending
+            } else {
+                self.poll_complete(cx)
+            }
+        } else {
+            Poll::Pending
+        }
     }
 }
 
-impl<'a, S: DataStore> Write for Object<'a, S> {
-    /// The `io::Error` returned by this method can be converted into an `acid_store::Error`.
-    ///
-    /// # Errors
-    /// - `Error::InvalidData`: Ciphertext verification failed.
-    /// - `Error::Store`: An error occurred with the data store.
-    /// - `Error::Io`: An I/O error occurred.
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.object_writer().write(buf)
+impl<'a, S: DataStore> AsyncWrite for Object<'a, S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        self.borrow().object_writer().poll_write(cx, buf)
     }
 
-    /// The `io::Error` returned by this method can be converted into an `acid_store::Error`.
-    ///
-    /// # Errors
-    /// - `Error::InvalidData`: Ciphertext verification failed.
-    /// - `Error::Store`: An error occurred with the data store.
-    /// - `Error::Io`: An I/O error occurred.
-    fn flush(&mut self) -> io::Result<()> {
-        self.object_writer().flush()
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.borrow().object_writer().poll_flush(cx, buf)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.borrow().object_writer().poll_shutdown(cx, buf)
     }
 }
 

@@ -30,6 +30,11 @@ use super::id_table::UniqueId;
 use super::lock::Lock;
 use super::metadata::RepoMetadata;
 use super::object::Chunk;
+use futures::future::BoxFuture;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::task::Context;
 
 /// Information about a chunk in a repository.
 #[derive(Debug, PartialEq, Eq, Clone, Default, Serialize, Deserialize)]
@@ -86,8 +91,16 @@ impl ChunkLocation {
     }
 }
 
+/// The current operation being performed by and object.
+pub enum ObjectOperation<'a> {
+    Read(BoxFuture<'a, io::Result<()>>),
+    Write(BoxFuture<'a, io::Result<usize>>),
+    Flush(BoxFuture<'a, io::Result<()>>),
+    None,
+}
+
 /// The state associated with an `Object`.
-pub struct ObjectState {
+pub struct ObjectState<'a> {
     /// An object responsible for buffering and chunking data which has been written.
     pub chunker: IncrementalChunker,
 
@@ -98,6 +111,14 @@ pub struct ObjectState {
     ///
     /// If no data has been written, this is `None`.
     pub start_location: Option<ChunkLocation>,
+
+    /// The next seek position to seek to.
+    ///
+    /// This value is updated when `AsyncSeek::start_seek` is called, but the actual seek isn't
+    /// performed until, `AsyncSeek::poll_complete` is called. Once the seek is performed, this
+    /// value is set to `None`. If this value is `Some`, that means `AsyncSeek::start_seek` has been
+    /// called but `AsyncSeek::poll_complete` has not been.
+    pub next_position: Option<u64>,
 
     /// The current seek position of the object.
     pub position: u64,
@@ -112,6 +133,9 @@ pub struct ObjectState {
 
     /// Whether unflushed data has been written to the object.
     pub needs_flushed: bool,
+
+    /// The current operation to poll.
+    pub current_operation: ObjectOperation<'a>,
 }
 
 impl ObjectState {
@@ -121,10 +145,12 @@ impl ObjectState {
             chunker: IncrementalChunker::new(chunker),
             new_chunks: Vec::new(),
             start_location: None,
+            next_position: None,
             position: 0,
             buffered_chunk: None,
             read_buffer: Vec::new(),
             needs_flushed: false,
+            current_operation: ObjectOperation::None,
         }
     }
 }
